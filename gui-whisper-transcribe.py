@@ -7,6 +7,8 @@
 
 import threading
 import queue
+import mimetypes
+import shutil
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -21,8 +23,8 @@ except ImportError:
     raise SystemExit("⚠️  Instale a dependência: pip install openai-whisper")
 
 # 🟡 Altere/extenda conforme suas necessidades:
-EXTENSOES_SUPORTADAS = {'.ts', '.mp4', '.mkv'}
-MODELO = 'medium'    # tiny, base, small, medium, large
+# Filtra por MIME; extensoes desconhecidas passam para o ffmpeg validar.
+MODELO = 'large'    # tiny, base, small, medium, large
 
 model = None                 # instanciado lazily no 1.º processamento
 afila: "queue.Queue[Path]" = queue.Queue()
@@ -43,6 +45,20 @@ def sufixo_srt(video_path: Path) -> Path:
     return video_path.with_suffix('.srt')
 
 
+def ensure_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg nao encontrado no PATH. Instale o ffmpeg e reabra o app.")
+
+
+def is_media_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime:
+        return mime.startswith("audio/") or mime.startswith("video/")
+    return True
+
+
 def log(msg: str):
     log_text.configure(state='normal')
     log_text.insert('end', msg + "\n")
@@ -53,17 +69,23 @@ def log(msg: str):
 def add_files(paths):
     """Adiciona caminhos na fila (evita duplicados)."""
     added = 0
+    existing = set(listbox.get(0, 'end'))
     for pstr in paths:
         p = Path(pstr)
+        if not p.exists():
+            log(f"Arquivo nao encontrado: {p}")
+            continue
         if p.is_dir():
-            vids = [f for f in p.rglob('*') if f.suffix.lower() in EXTENSOES_SUPORTADAS]
+            vids = [f for f in p.rglob('*') if is_media_file(f)]
         else:
             vids = [p]
         for v in vids:
-            if v.suffix.lower() not in EXTENSOES_SUPORTADAS:
+            if not is_media_file(v):
                 continue
-            if v not in listbox.get(0, 'end'):
-                listbox.insert('end', v)
+            v_str = str(v)
+            if v_str not in existing:
+                listbox.insert('end', v_str)
+                existing.add(v_str)
                 added += 1
     if added:
         log(f"➕ {added} arquivo(s) adicionados à lista.")
@@ -171,10 +193,14 @@ def cancel_current():
 
 def process_video(video: Path):
     log(f"🎬 Processando: {video.name}")
+    if not video.exists():
+        log(f"Arquivo nao encontrado: {video}")
+        return
     srt_path = sufixo_srt(video)
     if srt_path.exists():
         log(f"⚠️  Pulando (SRT já existe): {srt_path.name}")
         return
+    ensure_ffmpeg()
     load_model_once()
     result = model.transcribe(str(video), fp16=False)
     with open(srt_path, 'w', encoding='utf-8') as f:

@@ -36,18 +36,33 @@ O script irá:
 """
 
 
+import mimetypes
+import shutil
 import whisper
 from pathlib import Path
 
 # 🟡 Altere/extenda conforme suas necessidades:
-EXTENSOES_SUPORTADAS = ['.ts', '.mp4', '.mkv']
 MODELO = 'medium'  # Pode usar: tiny, base, small, medium, large
+
+
+def ensure_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg nao encontrado no PATH. Instale o ffmpeg e reabra o app.")
+
+
+def is_media_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime:
+        return mime.startswith("audio/") or mime.startswith("video/")
+    return True
 
 # Carrega o modelo Whisper
 model = whisper.load_model(MODELO)
 
-# Encontra arquivos com extensões suportadas
-videos = [f for ext in EXTENSOES_SUPORTADAS for f in Path('.').glob(f'*{ext}')]
+# Encontra arquivos de midia no diretorio atual
+videos = [f for f in Path('.').iterdir() if is_media_file(f)]
 
 for video in videos:
     srt_path = video.with_suffix('.srt')
@@ -57,6 +72,7 @@ for video in videos:
         continue
 
     print(f"Transcrevendo: {video.name}")
+    ensure_ffmpeg()
     result = model.transcribe(str(video), fp16=False)
     
     # Salva como .srt
