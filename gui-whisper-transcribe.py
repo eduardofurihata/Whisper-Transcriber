@@ -1,53 +1,28 @@
-# whisper_gui.py – Interface gráfica simples e gratuita usando Tkinter + tkinterdnd2
+# gui-whisper-transcribe.py – Interface gráfica para transcrição com Whisper (PySide6)
 # Requisitos:
-#   pip install openai-whisper tkinterdnd2
-# Em Windows o Tkinter já vem incluso.
+#   pip install faster-whisper PySide6-Essentials
 # Arraste vídeos ou escolha uma pasta: o script gera um .srt ao lado de cada vídeo.
-# Não carrega todos os vídeos na memória – processa um de cada vez.
 
+import sys
 import threading
 import queue
 import mimetypes
 import shutil
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD  # pip install tkinterdnd2
-except ImportError:
-    raise SystemExit("⚠️  Instale a dependência: pip install tkinterdnd2")
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QListWidget, QTextEdit, QFileDialog, QMessageBox,
+    QAbstractItemView,
+)
+from PySide6.QtCore import Signal, Qt
 
 try:
-    import whisper
+    from faster_whisper import WhisperModel
 except ImportError:
-    raise SystemExit("⚠️  Instale a dependência: pip install openai-whisper")
+    sys.exit("⚠️  Instale a dependência: pip install faster-whisper")
 
-# 🟡 Altere/extenda conforme suas necessidades:
-# Filtra por MIME; extensoes desconhecidas passam para o ffmpeg validar.
-MODELO = 'large'    # tiny, base, small, medium, large
-
-model = None                 # instanciado lazily no 1.º processamento
-afila: "queue.Queue[Path]" = queue.Queue()
-processing_thread = None
-cancel_event = threading.Event()
-
-# ------------- Funções auxiliares ------------------
-
-def load_model_once():
-    global model
-    if model is None:
-        log("Carregando modelo Whisper (%s)… isso pode levar alguns segundos…" % MODELO)
-        model = whisper.load_model(MODELO)
-        log("✅ Modelo carregado.")
-
-
-def sufixo_srt(video_path: Path) -> Path:
-    return video_path.with_suffix('.srt')
-
-
-def ensure_ffmpeg():
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg nao encontrado no PATH. Instale o ffmpeg e reabra o app.")
+MODELO = 'large-v3'
 
 
 def is_media_file(path: Path) -> bool:
@@ -59,207 +34,238 @@ def is_media_file(path: Path) -> bool:
     return True
 
 
-def log(msg: str):
-    log_text.configure(state='normal')
-    log_text.insert('end', msg + "\n")
-    log_text.see('end')
-    log_text.configure(state='disabled')
+def ensure_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg não encontrado no PATH. Instale o ffmpeg e reabra o app.")
 
 
-def add_files(paths):
-    """Adiciona caminhos na fila (evita duplicados)."""
-    added = 0
-    existing = set(listbox.get(0, 'end'))
-    for pstr in paths:
-        p = Path(pstr)
-        if not p.exists():
-            log(f"Arquivo nao encontrado: {p}")
-            continue
-        if p.is_dir():
-            vids = [f for f in p.rglob('*') if is_media_file(f)]
-        else:
-            vids = [p]
-        for v in vids:
-            if not is_media_file(v):
+class DropListWidget(QListWidget):
+    """QListWidget com suporte nativo a drag-and-drop de arquivos."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            paths = [url.toLocalFile() for url in event.mimeData().urls()]
+            self.window().add_files(paths)
+            event.acceptProposedAction()
+
+
+class MainWindow(QMainWindow):
+    log_signal = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Whisper SRT – Interface")
+        self.resize(700, 550)
+
+        self.model = None
+        self.file_queue: queue.Queue[Path] = queue.Queue()
+        self.processing_thread = None
+        self.cancel_event = threading.Event()
+
+        self.log_signal.connect(self._append_log)
+        self._build_ui()
+        self.log("💡 Arraste arquivos ou clique em 'Pasta…' para começar.")
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        # Lista de arquivos
+        self.listbox = DropListWidget(self)
+        layout.addWidget(self.listbox, stretch=1)
+
+        # Botões
+        btn_layout = QHBoxLayout()
+        actions = [
+            ("📁 Pasta…", self.choose_folder),
+            ("▶ Processar seleção", self.process_next),
+            ("▶▶ Processar todos", self.process_all),
+            ("⏹ Cancelar", self.cancel_current),
+            ("✕ Remover seleção", self.remove_selected),
+            ("🗑 Limpar lista", self.remove_all),
+            ("📋 Copiar Log", self.copy_log),
+        ]
+        for text, callback in actions:
+            btn = QPushButton(text)
+            btn.clicked.connect(callback)
+            btn_layout.addWidget(btn)
+        layout.addLayout(btn_layout)
+
+        # Log
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(180)
+        layout.addWidget(self.log_text)
+
+    def _append_log(self, msg: str):
+        self.log_text.append(msg)
+        self.log_text.ensureCursorVisible()
+
+    def log(self, msg: str):
+        self.log_signal.emit(msg)
+
+    # -- Ações --
+
+    def add_files(self, paths: list[str]):
+        existing = set()
+        for i in range(self.listbox.count()):
+            existing.add(self.listbox.item(i).text())
+
+        added = 0
+        for pstr in paths:
+            p = Path(pstr)
+            if not p.exists():
+                self.log(f"Arquivo não encontrado: {p}")
                 continue
-            v_str = str(v)
-            if v_str not in existing:
-                listbox.insert('end', v_str)
-                existing.add(v_str)
-                added += 1
-    if added:
-        log(f"➕ {added} arquivo(s) adicionados à lista.")
+            if p.is_dir():
+                files = [f for f in p.rglob('*') if is_media_file(f)]
+            else:
+                files = [p] if is_media_file(p) else []
+            for f in files:
+                f_str = str(f)
+                if f_str not in existing:
+                    self.listbox.addItem(f_str)
+                    existing.add(f_str)
+                    added += 1
+        if added:
+            self.log(f"➕ {added} arquivo(s) adicionados à lista.")
 
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Escolha uma pasta contendo vídeos")
+        if folder:
+            self.add_files([folder])
 
-def choose_folder():
-    folder = filedialog.askdirectory(title="Escolha uma pasta contendo vídeos")
-    if folder:
-        add_files([folder])
+    def remove_selected(self):
+        items = self.listbox.selectedItems()
+        if not items:
+            return
+        for item in items:
+            self.listbox.takeItem(self.listbox.row(item))
+        self.log(f"🗑️ {len(items)} item(ns) removido(s) da lista.")
 
+    def remove_all(self):
+        self.listbox.clear()
+        self.log("🗑️ Lista limpa.")
 
-def on_drop(event):
-    # event.data é string com paths separadas por espaços; paths com espaços vêm entre { }
-    raw = event.data
-    # Divide respeitando chaves
-    files = []
-    current = ''
-    inside_brace = False
-    for char in raw:
-        if char == '{':
-            inside_brace = True
-            current = ''
-        elif char == '}':
-            inside_brace = False
-            files.append(current)
-            current = ''
-        elif char == ' ' and not inside_brace:
-            if current:
-                files.append(current)
-                current = ''
+    def copy_log(self):
+        text = self.log_text.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.log("📋 Log copiado para a área de transferência.")
+
+    def process_next(self):
+        if self.listbox.count() == 0:
+            QMessageBox.information(self, "Nada a processar", "Adicione arquivos primeiro.")
+            return
+        self._start_processing(all_items=False)
+
+    def process_all(self):
+        if self.listbox.count() == 0:
+            QMessageBox.information(self, "Nada a processar", "Adicione arquivos primeiro.")
+            return
+        self._start_processing(all_items=True)
+
+    def cancel_current(self):
+        if not self.processing_thread or not self.processing_thread.is_alive():
+            return
+        self.cancel_event.set()
+        self.log("⏹️ Cancelamento solicitado. Será efetivado após o arquivo atual.")
+
+    def _start_processing(self, all_items: bool):
+        if self.processing_thread and self.processing_thread.is_alive():
+            QMessageBox.warning(self, "Processamento em andamento", "Aguarde o término ou cancele.")
+            return
+
+        self.cancel_event.clear()
+        self.file_queue.queue.clear()
+
+        if all_items:
+            items = [self.listbox.item(i).text() for i in range(self.listbox.count())]
         else:
-            current += char
-    if current:
-        files.append(current)
-    add_files(files)
-    return 'break'
+            selected = self.listbox.selectedItems()
+            if selected:
+                items = [item.text() for item in selected]
+            else:
+                items = [self.listbox.item(0).text()]
+
+        for it in items:
+            self.file_queue.put(Path(it))
+
+        self.processing_thread = threading.Thread(target=self._worker, daemon=True)
+        self.processing_thread.start()
+
+    def _worker(self):
+        while not self.file_queue.empty() and not self.cancel_event.is_set():
+            video: Path = self.file_queue.get()
+            try:
+                self._process_video(video)
+            except Exception as e:
+                self.log(f"❌ Erro ao processar {video.name}: {e}")
+            finally:
+                self.file_queue.task_done()
+        self.log("🏁 Fila concluída ou cancelada.")
+
+    def _load_model(self):
+        if self.model is None:
+            self.log(f"⬇️ Baixando/carregando modelo Whisper ({MODELO})… "
+                     f"na primeira vez, o download pode levar vários minutos…")
+            try:
+                self.model = WhisperModel(MODELO, device="cuda", compute_type="int8")
+            except Exception as e:
+                self.log(f"⚠️ Falha ao carregar na GPU: {e}")
+                self.log("Tentando carregar na CPU…")
+                self.model = WhisperModel(MODELO, device="cpu", compute_type="int8")
+            self.log("✅ Modelo carregado.")
+
+    def _process_video(self, video: Path):
+        self.log(f"🎬 Processando: {video.name}")
+        if not video.exists():
+            self.log(f"Arquivo não encontrado: {video}")
+            return
+
+        srt_path = video.with_suffix('.srt')
+        if srt_path.exists():
+            self.log(f"⚠️ Pulando (SRT já existe): {srt_path.name}")
+            return
+
+        ensure_ffmpeg()
+        self._load_model()
+        segments, info = self.model.transcribe(str(video), beam_size=5)
+
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            for i, segment in enumerate(segments):
+                start = segment.start
+                end = segment.end
+                text = segment.text.strip()
+
+                def format_time(t):
+                    h = int(t // 3600)
+                    m = int((t % 3600) // 60)
+                    s = int(t % 60)
+                    ms = int((t - int(t)) * 1000)
+                    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+                f.write(f"{i+1}\n{format_time(start)} --> {format_time(end)}\n{text}\n\n")
+
+        self.log(f"✅ SRT gerado: {srt_path.name}")
 
 
-def remove_selected():
-    sel = list(listbox.curselection())
-    sel.reverse()
-    for idx in sel:
-        listbox.delete(idx)
-    log(f"🗑️  {len(sel)} item(ns) removido(s) da lista.")
-
-
-def remove_all():
-    listbox.delete(0, 'end')
-    log("🗑️  Lista limpa.")
-
-
-def process_next():
-    if listbox.size() == 0:
-        messagebox.showinfo("Nada a processar", "Adicione arquivos primeiro.")
-        return
-    start_processing(all_items=False)
-
-
-def process_all():
-    if listbox.size() == 0:
-        messagebox.showinfo("Nada a processar", "Adicione arquivos primeiro.")
-        return
-    start_processing(all_items=True)
-
-
-def start_processing(all_items: bool):
-    global processing_thread
-    if processing_thread and processing_thread.is_alive():
-        messagebox.showwarning("Processamento em andamento", "Aguarde o término ou cancele.")
-        return
-    cancel_event.clear()
-    # Preenche a fila
-    afila.queue.clear()
-    items = listbox.get(0, 'end')
-    if not all_items:  # só o selecionado ou o primeiro
-        if listbox.curselection():
-            items = [items[listbox.curselection()[0]]]
-        else:
-            items = [items[0]]
-    for it in items:
-        afila.put(Path(it))
-    # Thread para processamento
-    processing_thread = threading.Thread(target=worker, daemon=True)
-    processing_thread.start()
-
-
-def worker():
-    while not afila.empty() and not cancel_event.is_set():
-        video: Path = afila.get()
-        try:
-            process_video(video)
-        except Exception as e:
-            log(f"❌ Erro ao processar {video.name}: {e}")
-        finally:
-            afila.task_done()
-    log("🏁 Fila concluída ou cancelada.")
-
-
-def cancel_current():
-    if not processing_thread or not processing_thread.is_alive():
-        return
-    cancel_event.set()
-    log("⏹️  Cancelamento solicitado. Será efetivado após o arquivo atual.")
-
-
-def process_video(video: Path):
-    log(f"🎬 Processando: {video.name}")
-    if not video.exists():
-        log(f"Arquivo nao encontrado: {video}")
-        return
-    srt_path = sufixo_srt(video)
-    if srt_path.exists():
-        log(f"⚠️  Pulando (SRT já existe): {srt_path.name}")
-        return
-    ensure_ffmpeg()
-    load_model_once()
-    result = model.transcribe(str(video), fp16=False)
-    with open(srt_path, 'w', encoding='utf-8') as f:
-        for i, segment in enumerate(result['segments']):
-            start = segment['start']
-            end = segment['end']
-            text = segment['text'].strip()
-
-            def format_time(t):
-                h = int(t // 3600)
-                m = int((t % 3600) // 60)
-                s = int(t % 60)
-                ms = int((t - int(t)) * 1000)
-                return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-            f.write(f"{i+1}\n{format_time(start)} --> {format_time(end)}\n{text}\n\n")
-    log(f"✅ SRT gerado: {srt_path.name}")
-
-# ------------- GUI ------------------
-
-root = TkinterDnD.Tk()
-root.title("Whisper SRT – Interface")
-root.geometry("650x500")
-
-# Frame principal
-frame = ttk.Frame(root, padding=10)
-frame.pack(fill='both', expand=True)
-
-# Listbox com scroll
-list_frame = ttk.Frame(frame)
-list_frame.pack(fill='both', expand=True)
-listbox = tk.Listbox(list_frame, selectmode='extended')
-scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=listbox.yview)
-listbox.configure(yscrollcommand=scrollbar.set)
-listbox.pack(side='left', fill='both', expand=True)
-scrollbar.pack(side='right', fill='y')
-
-# Drag‑and‑drop
-listbox.drop_target_register(DND_FILES)
-listbox.dnd_bind('<<Drop>>', on_drop)
-
-# Botões
-btn_frame = ttk.Frame(frame)
-btn_frame.pack(fill='x', pady=5)
-
-actions = [
-    ("➕ Pasta…", choose_folder),
-    ("➡️ Processar seleção", process_next),
-    ("▶️ Processar todos", process_all),
-    ("⏹️ Cancelar atual", cancel_current),
-    ("❌ Remover seleção", remove_selected),
-    ("🗑️ Limpar lista", remove_all),
-]
-for txt, cmd in actions:
-    ttk.Button(btn_frame, text=txt, command=cmd).pack(side='left', padx=2, pady=2)
-
-# Log
-log_text = tk.Text(frame, height=10, state='disabled', wrap='word')
-log_text.pack(fill='both', expand=False, pady=(10,0))
-
-log("💡 Arraste arquivos ou clique em ➕ Pasta… para começar.")
-root.mainloop()
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
