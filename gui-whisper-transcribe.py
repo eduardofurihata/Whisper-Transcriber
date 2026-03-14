@@ -4,6 +4,7 @@
 # Arraste vídeos ou escolha uma pasta: o script gera um .srt ao lado de cada vídeo.
 
 import sys
+import logging
 import threading
 import queue
 import mimetypes
@@ -37,6 +38,18 @@ def is_media_file(path: Path) -> bool:
 def ensure_ffmpeg():
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg não encontrado no PATH. Instale o ffmpeg e reabra o app.")
+
+
+class SignalLogHandler(logging.Handler):
+    """Redireciona mensagens de logging para um Signal do Qt."""
+
+    def __init__(self, signal):
+        super().__init__()
+        self.signal = signal
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.signal.emit(msg)
 
 
 class DropListWidget(QListWidget):
@@ -223,12 +236,26 @@ class MainWindow(QMainWindow):
         if self.model is None:
             self.log(f"⬇️ Baixando/carregando modelo Whisper ({MODELO})… "
                      f"na primeira vez, o download pode levar vários minutos…")
+
+            # Redireciona logs do huggingface_hub para a GUI
+            handler = SignalLogHandler(self.log_signal)
+            handler.setFormatter(logging.Formatter("  %(message)s"))
+            for name in ("huggingface_hub", "faster_whisper"):
+                logger = logging.getLogger(name)
+                logger.setLevel(logging.INFO)
+                logger.addHandler(handler)
+
             try:
                 self.model = WhisperModel(MODELO, device="cuda", compute_type="int8")
             except Exception as e:
                 self.log(f"⚠️ Falha ao carregar na GPU: {e}")
                 self.log("Tentando carregar na CPU…")
                 self.model = WhisperModel(MODELO, device="cpu", compute_type="int8")
+
+            # Remove handlers após carregar para não poluir o log
+            for name in ("huggingface_hub", "faster_whisper"):
+                logging.getLogger(name).removeHandler(handler)
+
             self.log("✅ Modelo carregado.")
 
     def _process_video(self, video: Path):
@@ -244,7 +271,19 @@ class MainWindow(QMainWindow):
 
         ensure_ffmpeg()
         self._load_model()
-        segments, info = self.model.transcribe(str(video), beam_size=5)
+
+        try:
+            segments, info = self.model.transcribe(str(video), beam_size=5)
+        except Exception as e:
+            cuda_keywords = ("libcublas", "libcudnn", "libcufft", "CUDA", "cuda")
+            if any(k in str(e) for k in cuda_keywords):
+                self.log(f"⚠️ Falha de CUDA durante transcrição: {e}")
+                self.log("Recarregando modelo na CPU…")
+                self.model = WhisperModel(MODELO, device="cpu", compute_type="int8")
+                self.log("✅ Modelo recarregado na CPU.")
+                segments, info = self.model.transcribe(str(video), beam_size=5)
+            else:
+                raise
 
         with open(srt_path, 'w', encoding='utf-8') as f:
             for i, segment in enumerate(segments):
